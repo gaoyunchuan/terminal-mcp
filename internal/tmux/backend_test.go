@@ -3,6 +3,7 @@ package tmux
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -73,4 +74,73 @@ func TestBackendRunCommandTimeoutReturnsPartialOutput(t *testing.T) {
 	if result.Status != "timeout" || result.ExitCode != nil {
 		t.Fatalf("result = %+v", result)
 	}
+}
+
+func TestBackendRunCommandReadsOutputFromPaneCapture(t *testing.T) {
+	var pastedScript string
+	backend := newBackendForTest(func(_ context.Context, stdin string, args ...string) ([]byte, error) {
+		switch args[0] {
+		case "load-buffer":
+			pastedScript = stdin
+			return nil, nil
+		case "paste-buffer":
+			return nil, nil
+		case "capture-pane":
+			begin := extractScriptMarker(t, pastedScript, "__TERMINAL_MCP_BEGIN_")
+			done := extractScriptMarker(t, pastedScript, "__TERMINAL_MCP_DONE_")
+			return []byte(fmt.Sprintf("[root@remote log]# %s\n%s\n/var/log\n%s:0\n[root@remote log]# ", pastedScript, begin, done)), nil
+		default:
+			t.Fatalf("unexpected tmux args: %q", args)
+			return nil, nil
+		}
+	})
+
+	result, err := backend.RunCommand(context.Background(), "tmux:%1", "pwd", time.Second, 1024)
+	if err != nil {
+		t.Fatalf("RunCommand returned error: %v", err)
+	}
+	if strings.Contains(pastedScript, "/var/folders/") {
+		t.Fatalf("pasted script contains local temp path: %s", pastedScript)
+	}
+	if result.Status != "completed" || result.ExitCode == nil || *result.ExitCode != 0 || result.Output != "/var/log" {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
+func TestParseRunCapturePreservesOutputWithoutTrailingNewline(t *testing.T) {
+	output, truncated, code, ok := parseRunCapture("prompt\nBEGIN\nrun-ok\nDONE:0\nprompt", "BEGIN", "DONE", 1024)
+	if !ok || truncated || code != 0 || output != "run-ok" {
+		t.Fatalf("output=%q truncated=%v code=%d ok=%v", output, truncated, code, ok)
+	}
+}
+
+func TestParseRunCaptureReturnsNonZeroExitCode(t *testing.T) {
+	output, truncated, code, ok := parseRunCapture("prompt\nBEGIN\nfailed\nDONE:7\nprompt", "BEGIN", "DONE", 1024)
+	if !ok || truncated || code != 7 || output != "failed" {
+		t.Fatalf("output=%q truncated=%v code=%d ok=%v", output, truncated, code, ok)
+	}
+}
+
+func TestParseRunCaptureReturnsPartialOutputBeforeDoneMarker(t *testing.T) {
+	output, truncated, code, ok := parseRunCapture("prompt\nBEGIN\npartial", "BEGIN", "DONE", 4)
+	if ok || code != 0 || !truncated || output != "tial" {
+		t.Fatalf("output=%q truncated=%v code=%d ok=%v", output, truncated, code, ok)
+	}
+}
+
+func extractScriptMarker(t *testing.T, script string, prefix string) string {
+	t.Helper()
+	start := strings.Index(script, prefix)
+	if start < 0 {
+		t.Fatalf("script %q does not contain marker prefix %q", script, prefix)
+	}
+	end := start
+	for end < len(script) {
+		ch := script[end]
+		if (ch < 'A' || ch > 'Z') && (ch < 'a' || ch > 'z') && (ch < '0' || ch > '9') && ch != '_' {
+			break
+		}
+		end++
+	}
+	return script[start:end]
 }

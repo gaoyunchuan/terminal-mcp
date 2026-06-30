@@ -5,15 +5,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 )
 
 const listPanesFormat = "#{pane_id}|#{session_name}|#{window_index}|#{pane_index}|#{pane_title}|#{pane_current_path}|#{pane_current_command}"
+const runCommandCaptureStart = "-10000"
 
 type runnerFunc func(ctx context.Context, stdin string, args ...string) ([]byte, error)
 
@@ -91,12 +90,15 @@ func (b *Backend) RunCommand(ctx context.Context, sessionID string, command stri
 	if strings.TrimSpace(command) == "" || strings.ContainsRune(command, '\x00') {
 		return RunResult{}, NewError(ErrInvalidArgument, "command must be non-empty text without NUL bytes")
 	}
+	paneID, err := ParseSessionID(sessionID)
+	if err != nil {
+		return RunResult{}, err
+	}
 	start := time.Now()
 	id := strconv.FormatInt(start.UnixNano(), 36)
-	outputPath := filepath.Join(os.TempDir(), "terminal-mcp-"+id+".out")
-	statusPath := filepath.Join(os.TempDir(), "terminal-mcp-"+id+".status")
-	marker := "__TERMINAL_MCP_DONE_" + id + "__"
-	script := buildRunScript(command, outputPath, statusPath, marker)
+	beginMarker := "__TERMINAL_MCP_BEGIN_" + id + "__"
+	doneMarker := "__TERMINAL_MCP_DONE_" + id + "__"
+	script := buildRunScript(command, beginMarker, doneMarker)
 
 	if _, err := b.SendText(ctx, sessionID, script+"\n"); err != nil {
 		return RunResult{}, err
@@ -112,7 +114,7 @@ func (b *Backend) RunCommand(ctx context.Context, sessionID string, command stri
 		case <-ctx.Done():
 			return RunResult{}, NewError(ErrInternal, ctx.Err().Error())
 		case <-deadline.C:
-			output, truncated := readTailFile(outputPath, maxBytes)
+			output, truncated, _, _ := b.readRunCapture(ctx, paneID, beginMarker, doneMarker, maxBytes)
 			return RunResult{
 				SessionID:  sessionID,
 				Command:    command,
@@ -123,13 +125,10 @@ func (b *Backend) RunCommand(ctx context.Context, sessionID string, command stri
 				Truncated:  truncated,
 			}, nil
 		case <-ticker.C:
-			code, ok := readExitCode(statusPath)
+			output, truncated, code, ok := b.readRunCapture(ctx, paneID, beginMarker, doneMarker, maxBytes)
 			if !ok {
 				continue
 			}
-			output, truncated := readTailFile(outputPath, maxBytes)
-			_ = os.Remove(outputPath)
-			_ = os.Remove(statusPath)
 			return RunResult{
 				SessionID:  sessionID,
 				Command:    command,
@@ -183,12 +182,19 @@ func isNoServer(out []byte) bool {
 	return strings.Contains(string(out), "no server running")
 }
 
-func buildRunScript(command, outputPath, statusPath, marker string) string {
-	return fmt.Sprintf("__terminal_mcp_out=%s; __terminal_mcp_status=%s; __terminal_mcp_cmd=%s; eval \"$__terminal_mcp_cmd\" > \"$__terminal_mcp_out\" 2>&1; __terminal_mcp_code=$?; printf '%%s\\n' \"$__terminal_mcp_code\" > \"$__terminal_mcp_status\"; printf '\\n%s:%%s\\n' \"$__terminal_mcp_code\"; (sleep 300; rm -f \"$__terminal_mcp_out\" \"$__terminal_mcp_status\") >/dev/null 2>&1 &",
-		shellQuote(outputPath),
-		shellQuote(statusPath),
+func (b *Backend) readRunCapture(ctx context.Context, paneID, beginMarker, doneMarker string, maxBytes int) (string, bool, int, bool) {
+	out, err := b.run(ctx, "", "capture-pane", "-p", "-J", "-t", paneID, "-S", runCommandCaptureStart)
+	if err != nil {
+		return "", false, 0, false
+	}
+	return parseRunCapture(string(out), beginMarker, doneMarker, maxBytes)
+}
+
+func buildRunScript(command, beginMarker, doneMarker string) string {
+	return fmt.Sprintf("__terminal_mcp_cmd=%s; printf '\\n%%s\\n' %s; eval \"$__terminal_mcp_cmd\" 2>&1; __terminal_mcp_code=$?; printf '\\n%s:%%s\\n' \"$__terminal_mcp_code\"",
 		shellQuote(command),
-		marker,
+		shellQuote(beginMarker),
+		doneMarker,
 	)
 }
 
@@ -196,22 +202,65 @@ func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
-func readExitCode(path string) (int, bool) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, false
+func parseRunCapture(content, beginMarker, doneMarker string, maxBytes int) (string, bool, int, bool) {
+	_, beginLineEnd, ok := findExactLine(content, beginMarker)
+	if !ok {
+		return "", false, 0, false
 	}
-	code, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil {
-		return 0, false
+	outputStart := beginLineEnd
+	if outputStart < len(content) && content[outputStart] == '\n' {
+		outputStart++
 	}
-	return code, true
+
+	doneSearchStart := outputStart
+	donePrefix := doneMarker + ":"
+	for doneSearchStart <= len(content) {
+		lineStart, lineEnd := nextLine(content, doneSearchStart)
+		line := strings.TrimSuffix(content[lineStart:lineEnd], "\r")
+		if strings.HasPrefix(line, donePrefix) {
+			code, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, donePrefix)))
+			if err != nil {
+				return "", false, 0, false
+			}
+			outputEnd := lineStart
+			if outputEnd > outputStart && content[outputEnd-1] == '\n' {
+				outputEnd--
+			}
+			output, truncated := TailBytes(content[outputStart:outputEnd], maxBytes)
+			return output, truncated, code, true
+		}
+		if lineEnd == len(content) {
+			break
+		}
+		doneSearchStart = lineEnd + 1
+	}
+
+	output, truncated := TailBytes(content[outputStart:], maxBytes)
+	return output, truncated, 0, false
 }
 
-func readTailFile(path string, maxBytes int) (string, bool) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", false
+func findExactLine(content, want string) (int, int, bool) {
+	for start := 0; start <= len(content); {
+		lineStart, lineEnd := nextLine(content, start)
+		line := strings.TrimSuffix(content[lineStart:lineEnd], "\r")
+		if line == want {
+			return lineStart, lineEnd, true
+		}
+		if lineEnd == len(content) {
+			break
+		}
+		start = lineEnd + 1
 	}
-	return TailBytes(string(data), maxBytes)
+	return 0, 0, false
+}
+
+func nextLine(content string, start int) (int, int) {
+	if start > len(content) {
+		return len(content), len(content)
+	}
+	relativeEnd := strings.IndexByte(content[start:], '\n')
+	if relativeEnd < 0 {
+		return start, len(content)
+	}
+	return start, start + relativeEnd
 }
